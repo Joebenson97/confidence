@@ -25,7 +25,11 @@ class BootstrapComputer(StatisticalMethodABC):
         return variance
 
     def std_err(self, df: DataFrame, **kwargs: Any) -> Optional[Union[float, Series]]:
-        return None
+        bootstrap_samples = kwargs[BOOTSTRAPS]
+        return np.sqrt(
+            df[bootstrap_samples + SFX1].map(lambda a: a.var() / len(a))
+            + df[bootstrap_samples + SFX2].map(lambda a: a.var() / len(a))
+        )
 
     def add_point_estimate_ci(self, df: DataFrame, **kwargs: Any) -> DataFrame:
         bootstrap_samples = kwargs[BOOTSTRAPS]
@@ -35,7 +39,14 @@ class BootstrapComputer(StatisticalMethodABC):
         return df
 
     def p_value(self, df: DataFrame, **kwargs: Any) -> Union[float, Series]:
-        return -1
+        bootstrap_samples = kwargs[BOOTSTRAPS]
+        diff = df.apply(
+            lambda row: row[bootstrap_samples + SFX2] - row[bootstrap_samples + SFX1],
+            axis=1,
+        )
+        # Two-sided p-value: proportion of bootstrap differences <= 0
+        p = diff.map(lambda d: 2 * min(np.mean(d <= 0), np.mean(d >= 0)))
+        return p
 
     def ci(self, df: DataFrame, alpha_column: str, **kwargs: Any) -> Tuple[Series, Series]:
         bootstrap_samples = kwargs[BOOTSTRAPS]

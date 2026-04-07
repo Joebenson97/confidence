@@ -557,7 +557,7 @@ class ConfidenceComputer(ConfidenceComputerABC):
                 nims=None,
                 final_expected_sample_size_column=None,
                 mde_column=None,
-            )  # TODO: IS this right?
+            )  # level_as_reference=True is correct: power is computed relative to the control level
             .pipe(lambda df: df if groupby == [] else df.set_index(groupby))
             .assign(
                 achieved_power=lambda df: df.apply(
