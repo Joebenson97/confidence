@@ -629,9 +629,11 @@ def _p_value(df: DataFrame, **kwargs: Any) -> float:
 
 
 def _powered_effect_and_required_sample_size_from_difference_df(df: DataFrame, **kwargs: Any) -> DataFrame:
-    if df[kwargs[METHOD]].values[0] not in [ZTEST, ZTESTLINREG] and kwargs[MDE] in df:
+    method = df[kwargs[METHOD]].values[0]
+    computer = confidence_computers[method]
+    if not computer.supports_mde and kwargs[MDE] in df:
         raise ValueError("Minimum detectable effects only supported for ZTest.")
-    elif df[kwargs[METHOD]].values[0] not in [ZTEST, ZTESTLINREG] or (df[ADJUSTED_POWER].isna()).any():
+    elif not computer.supports_powered_effect or (df[ADJUSTED_POWER].isna()).any():
         df[POWERED_EFFECT] = None
         df[REQUIRED_SAMPLE_SIZE] = None
         df[REQUIRED_SAMPLE_SIZE_METRIC] = None

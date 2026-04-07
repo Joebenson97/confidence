@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Any, Optional, Tuple, Union
 
 import numpy as np
@@ -46,6 +48,7 @@ from spotify_confidence.analysis.constants import (
     TWO_SIDED,
     VARIANCE,
 )
+from spotify_confidence.analysis.frequentist.confidence_computers.base_computer import BaseNumeratorDenominatorComputer
 from spotify_confidence.analysis.frequentist.sequential_bound_solver import (
     CalculationResult,
     ComputationState,
@@ -59,267 +62,284 @@ def sequential_bounds(
     return bounds(t, alpha, rho=2, ztrun=8, sides=sides, max_nints=1000, state=state)
 
 
-def point_estimate(df: DataFrame, **kwargs: Any) -> float:
-    numerator = kwargs[NUMERATOR]
-    denominator = kwargs[DENOMINATOR]
-    if (df[denominator] == 0).any():
-        raise ValueError("""Can't compute point estimate: denominator is 0""")
-    return df[numerator] / df[denominator]
+class ZTestComputer(BaseNumeratorDenominatorComputer):
+    """Z-test based statistical method -- the most feature-complete computer."""
 
+    @property
+    def supports_sequential(self) -> bool:
+        return True
 
-def variance(df: DataFrame, **kwargs: Any) -> float:
-    numerator = kwargs[NUMERATOR]
-    denominator = kwargs[DENOMINATOR]
-    numerator_sumsq = kwargs[NUMERATOR_SUM_OF_SQUARES]
-    binary = df[numerator_sumsq] == df[numerator]
-    if binary.all():
-        # This equals row[POINT_ESTIMATE]*(1-row[POINT_ESTIMATE]) when the data is binary,
-        # and also gives a robust fallback in case it's not
-        variance = df[numerator_sumsq] / df[denominator] - df[ORIGINAL_POINT_ESTIMATE] ** 2
-    else:
-        variance = (df[numerator_sumsq] - np.power(df[numerator], 2) / df[denominator]) / (df[denominator] - 1)
-    if (variance < 0).any():
-        raise ValueError("Computed variance is negative. Please check your inputs.")
-    return variance
+    @property
+    def supports_powered_effect(self) -> bool:
+        return True
 
+    @property
+    def supports_mde(self) -> bool:
+        return True
 
-def std_err(df: DataFrame, **kwargs: Any) -> float:
-    denominator = kwargs[DENOMINATOR]
-    return np.sqrt(df[VARIANCE + SFX1] / df[denominator + SFX1] + df[VARIANCE + SFX2] / df[denominator + SFX2])
+    def variance(self, df: DataFrame, **kwargs: Any) -> Union[float, Series]:
+        numerator = kwargs[NUMERATOR]
+        denominator = kwargs[DENOMINATOR]
+        numerator_sumsq = kwargs[NUMERATOR_SUM_OF_SQUARES]
+        binary = df[numerator_sumsq] == df[numerator]
+        if binary.all():
+            # This equals row[POINT_ESTIMATE]*(1-row[POINT_ESTIMATE]) when the data is binary,
+            # and also gives a robust fallback in case it's not
+            variance = df[numerator_sumsq] / df[denominator] - df[ORIGINAL_POINT_ESTIMATE] ** 2
+        else:
+            variance = (df[numerator_sumsq] - np.power(df[numerator], 2) / df[denominator]) / (df[denominator] - 1)
+        if (variance < 0).any():
+            raise ValueError("Computed variance is negative. Please check your inputs.")
+        return variance
 
+    def std_err(self, df: DataFrame, **kwargs: Any) -> Union[float, Series]:
+        denominator = kwargs[DENOMINATOR]
+        return np.sqrt(df[VARIANCE + SFX1] / df[denominator + SFX1] + df[VARIANCE + SFX2] / df[denominator + SFX2])
 
-def add_point_estimate_ci(df: DataFrame, **kwargs: Any) -> DataFrame:
-    denominator = kwargs[DENOMINATOR]
-    interval_size = kwargs[INTERVAL_SIZE]
-    df[CI_LOWER], df[CI_UPPER] = _zconfint_generic(
-        mean=df[POINT_ESTIMATE],
-        std_mean=np.sqrt(df[VARIANCE] / df[denominator]),
-        alpha=1 - interval_size,
-        alternative=TWO_SIDED,
-    )
-    return df
+    def add_point_estimate_ci(self, df: DataFrame, **kwargs: Any) -> DataFrame:
+        denominator = kwargs[DENOMINATOR]
+        interval_size = kwargs[INTERVAL_SIZE]
+        df[CI_LOWER], df[CI_UPPER] = _zconfint_generic(
+            mean=df[POINT_ESTIMATE],
+            std_mean=np.sqrt(df[VARIANCE] / df[denominator]),
+            alpha=1 - interval_size,
+            alternative=TWO_SIDED,
+        )
+        return df
 
+    def p_value(self, df: DataFrame, **kwargs: Any) -> Union[float, Series]:
+        _, p_value = _zstat_generic(
+            value1=df[POINT_ESTIMATE + SFX2],
+            value2=df[POINT_ESTIMATE + SFX1],
+            std_diff=df[STD_ERR],
+            alternative=df[PREFERENCE_TEST].values[0],
+            diff=df[NULL_HYPOTHESIS],
+        )
+        return p_value
 
-def p_value(df: DataFrame, **kwargs: Any) -> Series:
-    _, p_value = _zstat_generic(
-        value1=df[POINT_ESTIMATE + SFX2],
-        value2=df[POINT_ESTIMATE + SFX1],
-        std_diff=df[STD_ERR],
-        alternative=df[PREFERENCE_TEST].values[0],
-        diff=df[NULL_HYPOTHESIS],
-    )
-    return p_value
+    def ci(self, df: DataFrame, alpha_column: str, **kwargs: Any) -> Tuple[Series, Series]:
+        return _zconfint_generic(
+            mean=df[DIFFERENCE],
+            std_mean=df[STD_ERR],
+            alpha=df[alpha_column],
+            alternative=df[PREFERENCE_TEST].values[0],
+        )
 
+    def achieved_power(self, df: DataFrame, mde: float, alpha: float, **kwargs: Any) -> Union[int, float]:
+        denominator = kwargs[DENOMINATOR]
+        v1, v2 = df[VARIANCE + SFX1], df[VARIANCE + SFX2]
+        n1, n2 = df[denominator + SFX1], df[denominator + SFX2]
 
-def ci(df: DataFrame, alpha_column: str, **kwargs: Any) -> Tuple[Series, Series]:
-    return _zconfint_generic(
-        mean=df[DIFFERENCE], std_mean=df[STD_ERR], alpha=df[alpha_column], alternative=df[PREFERENCE_TEST].values[0]
-    )
+        var_pooled = ((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2)
 
+        return power_calculation(mde, var_pooled, alpha, n1, n2)
 
-def achieved_power(df: DataFrame, mde: float, alpha: float, **kwargs: Any) -> Union[int, float]:
-    denominator = kwargs[DENOMINATOR]
-    v1, v2 = df[VARIANCE + SFX1], df[VARIANCE + SFX2]
-    n1, n2 = df[denominator + SFX1], df[denominator + SFX2]
+    def compute_sequential_adjusted_alpha(self, df: DataFrame, **kwargs: Any) -> Series:
+        denominator = kwargs[DENOMINATOR]
+        final_expected_sample_size_column = kwargs[FINAL_EXPECTED_SAMPLE_SIZE]
+        ordinal_group_column = kwargs[ORDINAL_GROUP_COLUMN]
+        n_comparisons = kwargs[NUMBER_OF_COMPARISONS]
 
-    var_pooled = ((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2)
+        if not df.reset_index()[ordinal_group_column].is_unique:
+            raise ValueError("Ordinal values cannot be duplicated")
 
-    return power_calculation(mde, var_pooled, alpha, n1, n2)
-
-
-def compute_sequential_adjusted_alpha(df: DataFrame, **kwargs: Any):
-    denominator = kwargs[DENOMINATOR]
-    final_expected_sample_size_column = kwargs[FINAL_EXPECTED_SAMPLE_SIZE]
-    ordinal_group_column = kwargs[ORDINAL_GROUP_COLUMN]
-    n_comparisons = kwargs[NUMBER_OF_COMPARISONS]
-
-    if not df.reset_index()[ordinal_group_column].is_unique:
-        raise ValueError("Ordinal values cannot be duplicated")
-
-    def adjusted_alphas_for_group(grp: DataFrame) -> Series:
-        return (
-            sequential_bounds(
-                t=grp["sample_size_proportions"].values,
-                alpha=grp[ALPHA].values[0] / n_comparisons,
-                sides=2 if (grp[PREFERENCE_TEST] == TWO_SIDED).all() else 1,
-            )
-            .df.set_index(grp.index)
-            .assign(
-                **{
-                    ADJUSTED_ALPHA: lambda df: df.apply(
-                        lambda row: (
-                            2 * (1 - st.norm.cdf(row["zb"]))
-                            if (grp[PREFERENCE_TEST] == TWO_SIDED).all()
-                            else 1 - st.norm.cdf(row["zb"])
-                        ),
-                        axis=1,
-                    )
-                }
-            )
-        )[["zb", ADJUSTED_ALPHA]]
-
-    comparison_total_column = "comparison_total_" + denominator
-    return Series(
-        data=(
-            df.assign(**{comparison_total_column: df[denominator + SFX1] + df[denominator + SFX2]})
-            .assign(
-                max_sample_size=lambda df: (
-                    df[[comparison_total_column, final_expected_sample_size_column]].max(axis=1).max()
+        def adjusted_alphas_for_group(grp: DataFrame) -> Series:
+            return (
+                sequential_bounds(
+                    t=grp["sample_size_proportions"].values,
+                    alpha=grp[ALPHA].values[0] / n_comparisons,
+                    sides=2 if (grp[PREFERENCE_TEST] == TWO_SIDED).all() else 1,
                 )
+                .df.set_index(grp.index)
+                .assign(
+                    **{
+                        ADJUSTED_ALPHA: lambda df: df.apply(
+                            lambda row: (
+                                2 * (1 - st.norm.cdf(row["zb"]))
+                                if (grp[PREFERENCE_TEST] == TWO_SIDED).all()
+                                else 1 - st.norm.cdf(row["zb"])
+                            ),
+                            axis=1,
+                        )
+                    }
+                )
+            )[["zb", ADJUSTED_ALPHA]]
+
+        comparison_total_column = "comparison_total_" + denominator
+        return Series(
+            data=(
+                df.assign(**{comparison_total_column: df[denominator + SFX1] + df[denominator + SFX2]})
+                .assign(
+                    max_sample_size=lambda df: (
+                        df[[comparison_total_column, final_expected_sample_size_column]].max(axis=1).max()
+                    )
+                )
+                .assign(sample_size_proportions=lambda df: df[comparison_total_column] / df["max_sample_size"])
+                .pipe(adjusted_alphas_for_group)[ADJUSTED_ALPHA]
+            ),
+            name=ADJUSTED_ALPHA,
+        )
+
+    def ci_for_multiple_comparison_methods(
+        self,
+        df: DataFrame,
+        correction_method: str,
+        alpha: float,
+        w: float = 1.0,
+    ) -> Tuple[Union[Series, float], Union[Series, float]]:
+        if TWO_SIDED in df[PREFERENCE_TEST]:
+            raise ValueError(
+                "CIs can only be produced for one-sided tests when other multiple test corrections "
+                "methods than bonferroni are applied"
             )
-            .assign(sample_size_proportions=lambda df: df[comparison_total_column] / df["max_sample_size"])
-            .pipe(adjusted_alphas_for_group)[ADJUSTED_ALPHA]
-        ),
-        name=ADJUSTED_ALPHA,
-    )
+        m_scal = len(df)
+        num_significant = sum(df[IS_SIGNIFICANT])
+        r = m_scal - num_significant
 
+        def _aw(W: float, alpha: float, m_scal: float, r: int):
+            return alpha * (1 - (1 - W) * (m_scal - r) / m_scal)
 
-def ci_for_multiple_comparison_methods(
-    df: DataFrame,
-    correction_method: str,
-    alpha: float,
-    w: float = 1.0,
-) -> Tuple[Union[Series, float], Union[Series, float]]:
-    if TWO_SIDED in df[PREFERENCE_TEST]:
-        raise ValueError(
-            "CIs can only be produced for one-sided tests when other multiple test corrections "
-            "methods than bonferroni are applied"
-        )
-    m_scal = len(df)
-    num_significant = sum(df[IS_SIGNIFICANT])
-    r = m_scal - num_significant
+        def _bw(W: float, alpha: float, m_scal: float, r: int):
+            return 1 - (1 - alpha) / np.power((1 - (1 - W) * (1 - np.power((1 - alpha), (1 / m_scal)))), (m_scal - r))
 
-    def _aw(W: float, alpha: float, m_scal: float, r: int):
-        return alpha * (1 - (1 - W) * (m_scal - r) / m_scal)
-
-    def _bw(W: float, alpha: float, m_scal: float, r: int):
-        return 1 - (1 - alpha) / np.power((1 - (1 - W) * (1 - np.power((1 - alpha), (1 / m_scal)))), (m_scal - r))
-
-    if correction_method in [HOLM, SPOT_1_HOLM]:
-        adjusted_alpha_rej_equal_m = 1 - alpha / m_scal
-        adjusted_alpha_rej_less_m = 1 - (1 - w) * (alpha / m_scal)
-        adjusted_alpha_accept = 1 - _aw(w, alpha, m_scal, r) / r if r != 0 else 0
-    elif correction_method in [HOMMEL, SIMES_HOCHBERG, SPOT_1_HOMMEL, SPOT_1_SIMES_HOCHBERG]:
-        adjusted_alpha_rej_equal_m = np.power((1 - alpha), (1 / m_scal))
-        adjusted_alpha_rej_less_m = 1 - (1 - w) * (1 - np.power((1 - alpha), (1 / m_scal)))
-        adjusted_alpha_accept = 1 - _bw(w, alpha, m_scal, r) / r if r != 0 else 0
-    else:
-        raise ValueError(
-            "CIs not supported for correction method. "
-            f"Supported methods: {HOMMEL}, {HOLM}, {SIMES_HOCHBERG},"
-            f"{SPOT_1_HOLM}, {SPOT_1_HOMMEL} and {SPOT_1_SIMES_HOCHBERG}"
-        )
-
-    def _compute_ci_for_row(row: Series) -> Series:
-        if row[IS_SIGNIFICANT] and num_significant == m_scal:
-            alpha_adj = adjusted_alpha_rej_equal_m
-        elif row[IS_SIGNIFICANT] and num_significant < m_scal:
-            alpha_adj = adjusted_alpha_rej_less_m
+        if correction_method in [HOLM, SPOT_1_HOLM]:
+            adjusted_alpha_rej_equal_m = 1 - alpha / m_scal
+            adjusted_alpha_rej_less_m = 1 - (1 - w) * (alpha / m_scal)
+            adjusted_alpha_accept = 1 - _aw(w, alpha, m_scal, r) / r if r != 0 else 0
+        elif correction_method in [HOMMEL, SIMES_HOCHBERG, SPOT_1_HOMMEL, SPOT_1_SIMES_HOCHBERG]:
+            adjusted_alpha_rej_equal_m = np.power((1 - alpha), (1 / m_scal))
+            adjusted_alpha_rej_less_m = 1 - (1 - w) * (1 - np.power((1 - alpha), (1 / m_scal)))
+            adjusted_alpha_accept = 1 - _bw(w, alpha, m_scal, r) / r if r != 0 else 0
         else:
-            alpha_adj = adjusted_alpha_accept
+            raise ValueError(
+                "CIs not supported for correction method. "
+                f"Supported methods: {HOMMEL}, {HOLM}, {SIMES_HOCHBERG},"
+                f"{SPOT_1_HOLM}, {SPOT_1_HOMMEL} and {SPOT_1_SIMES_HOCHBERG}"
+            )
 
-        ci_sign = -1 if row[PREFERENCE_TEST] == "larger" else 1
-        bound1 = row[DIFFERENCE] + ci_sign * st.norm.ppf(alpha_adj) * row[STD_ERR]
-        if ci_sign == -1:
-            bound2 = max(row[NULL_HYPOTHESIS], bound1)
+        def _compute_ci_for_row(row: Series) -> Series:
+            if row[IS_SIGNIFICANT] and num_significant == m_scal:
+                alpha_adj = adjusted_alpha_rej_equal_m
+            elif row[IS_SIGNIFICANT] and num_significant < m_scal:
+                alpha_adj = adjusted_alpha_rej_less_m
+            else:
+                alpha_adj = adjusted_alpha_accept
+
+            ci_sign = -1 if row[PREFERENCE_TEST] == "larger" else 1
+            bound1 = row[DIFFERENCE] + ci_sign * st.norm.ppf(alpha_adj) * row[STD_ERR]
+            if ci_sign == -1:
+                bound2 = max(row[NULL_HYPOTHESIS], bound1)
+            else:
+                bound2 = min(row[NULL_HYPOTHESIS], bound1)
+
+            bound = bound2 if row[IS_SIGNIFICANT] else bound1
+
+            lower = bound if row[PREFERENCE_TEST] == "larger" else -np.inf
+            upper = bound if row[PREFERENCE_TEST] == "smaller" else np.inf
+
+            row[ADJUSTED_LOWER] = lower
+            row[ADJUSTED_UPPER] = upper
+
+            return row
+
+        ci_df = df.apply(_compute_ci_for_row, axis=1)[[ADJUSTED_LOWER, ADJUSTED_UPPER]]
+
+        return ci_df[ADJUSTED_LOWER], ci_df[ADJUSTED_UPPER]
+
+    def powered_effect(
+        self,
+        df: DataFrame,
+        z_alpha: float,
+        z_power: float,
+        binary: bool,
+        non_inferiority: bool,
+        avg_column: float,
+        var_column: float,
+    ) -> Series:
+        if binary and not non_inferiority:
+            effect = df.apply(
+                lambda row: _search_MDE_binary_local_search(
+                    control_avg=row[avg_column],
+                    control_var=row[var_column],
+                    non_inferiority=False,
+                    kappa=row["kappa"],
+                    proportion_of_total=row["proportion_of_total"],
+                    current_number_of_units=row["current_number_of_units"],
+                    z_alpha=z_alpha,
+                    z_power=z_power,
+                )[0],
+                axis=1,
+            )
         else:
-            bound2 = min(row[NULL_HYPOTHESIS], bound1)
+            treatment_var = _get_hypothetical_treatment_var(
+                binary_metric=binary,
+                non_inferiority=df[NIM] is not None,
+                control_avg=df[avg_column],
+                control_var=df[var_column],
+                hypothetical_effect=0,
+            )
+            n2_partial = np.power((z_alpha + z_power), 2) * (df[var_column] / df["kappa"] + treatment_var)
+            effect = np.sqrt(
+                (1 / (df["current_number_of_units"] * df["proportion_of_total"]))
+                * (n2_partial + df["kappa"] * n2_partial)
+            )
 
-        bound = bound2 if row[IS_SIGNIFICANT] else bound1
+        return effect
 
-        lower = bound if row[PREFERENCE_TEST] == "larger" else -np.inf
-        upper = bound if row[PREFERENCE_TEST] == "smaller" else np.inf
+    def required_sample_size(
+        self,
+        binary: Union[Series, bool] = False,
+        non_inferiority: Union[Series, bool] = False,
+        hypothetical_effect: Union[Series, float] = 0.0,
+        control_avg: Union[Series, float] = 0.0,
+        control_var: Union[Series, float] = 0.0,
+        z_alpha: Optional[float] = None,
+        kappa: Optional[float] = None,
+        proportion_of_total: Optional[Union[Series, float]] = None,
+        z_power: Optional[float] = None,
+    ) -> Union[Series, float]:
+        if kappa is None:
+            raise ValueError("kappa is None, must be postive float")
+        if proportion_of_total is None:
+            raise ValueError("proportion_of_total is None, must be between 0 and 1")
 
-        row[ADJUSTED_LOWER] = lower
-        row[ADJUSTED_UPPER] = upper
-
-        return row
-
-    ci_df = df.apply(_compute_ci_for_row, axis=1)[[ADJUSTED_LOWER, ADJUSTED_UPPER]]
-
-    return ci_df[ADJUSTED_LOWER], ci_df[ADJUSTED_UPPER]
-
-
-def ci_width(
-    z_alpha, binary, non_inferiority, hypothetical_effect, control_avg, control_var, control_count, treatment_count
-) -> Union[Series, float]:
-    treatment_var = _get_hypothetical_treatment_var(
-        binary, non_inferiority, control_avg, control_var, hypothetical_effect
-    )
-    _, std_err = _unequal_var_ttest_denom(control_var, control_count, treatment_var, treatment_count)
-
-    return 2 * z_alpha * std_err
-
-
-def powered_effect(
-    df: DataFrame,
-    z_alpha: float,
-    z_power: float,
-    binary: bool,
-    non_inferiority: bool,
-    avg_column: float,
-    var_column: float,
-) -> Series:
-    if binary and not non_inferiority:
-        effect = df.apply(
-            lambda row: _search_MDE_binary_local_search(
-                control_avg=row[avg_column],
-                control_var=row[var_column],
-                non_inferiority=False,
-                kappa=row["kappa"],
-                proportion_of_total=row["proportion_of_total"],
-                current_number_of_units=row["current_number_of_units"],
-                z_alpha=z_alpha,
-                z_power=z_power,
-            )[0],
-            axis=1,
+        treatment_var = np.vectorize(_get_hypothetical_treatment_var)(
+            binary, non_inferiority, control_avg, control_var, hypothetical_effect
         )
-    else:
+
+        n2 = _treatment_group_sample_size(
+            z_alpha=z_alpha,
+            z_power=z_power,
+            hypothetical_effect=hypothetical_effect,
+            control_var=control_var,
+            treatment_var=treatment_var,
+            kappa=kappa,
+        )
+        required_sample_size = np.ceil((n2 + n2 * kappa) / proportion_of_total)
+        return required_sample_size
+
+    def ci_width(
+        self,
+        z_alpha,
+        binary,
+        non_inferiority,
+        hypothetical_effect,
+        control_avg,
+        control_var,
+        control_count,
+        treatment_count,
+    ) -> Union[Series, float]:
         treatment_var = _get_hypothetical_treatment_var(
-            binary_metric=binary,
-            non_inferiority=df[NIM] is not None,
-            control_avg=df[avg_column],
-            control_var=df[var_column],
-            hypothetical_effect=0,
+            binary, non_inferiority, control_avg, control_var, hypothetical_effect
         )
-        n2_partial = np.power((z_alpha + z_power), 2) * (df[var_column] / df["kappa"] + treatment_var)
-        effect = np.sqrt(
-            (1 / (df["current_number_of_units"] * df["proportion_of_total"])) * (n2_partial + df["kappa"] * n2_partial)
-        )
+        _, std_err = _unequal_var_ttest_denom(control_var, control_count, treatment_var, treatment_count)
 
-    return effect
+        return 2 * z_alpha * std_err
 
 
-def required_sample_size(
-    binary: Union[Series, bool],
-    non_inferiority: Union[Series, bool],
-    hypothetical_effect: Union[Series, float],
-    control_avg: Union[Series, float],
-    control_var: Union[Series, float],
-    z_alpha: Optional[float] = None,
-    kappa: Optional[float] = None,
-    proportion_of_total: Optional[Union[Series, float]] = None,
-    z_power: Optional[float] = None,
-) -> Union[Series, float]:
-    if kappa is None:
-        raise ValueError("kappa is None, must be postive float")
-    if proportion_of_total is None:
-        raise ValueError("proportion_of_total is None, must be between 0 and 1")
-
-    treatment_var = np.vectorize(_get_hypothetical_treatment_var)(
-        binary, non_inferiority, control_avg, control_var, hypothetical_effect
-    )
-
-    n2 = _treatment_group_sample_size(
-        z_alpha=z_alpha,
-        z_power=z_power,
-        hypothetical_effect=hypothetical_effect,
-        control_var=control_var,
-        treatment_var=treatment_var,
-        kappa=kappa,
-    )
-    required_sample_size = np.ceil((n2 + n2 * kappa) / proportion_of_total)
-    return required_sample_size
+# ---------------------------------------------------------------------------
+# Module-level helper functions (kept private, used only by ZTestComputer)
+# ---------------------------------------------------------------------------
 
 
 def _search_MDE_binary_local_search(
@@ -371,10 +391,6 @@ def _search_MDE_binary_local_search(
         # take next value from queue
         interval = bounds_queue.pop(0)
 
-        # conduct a bounded local search, using a very small tol value improved
-        # performance during tests
-        # result = optimize.minimize_scalar(f, bounds=(interval[0], interval[1]),
-        # method='bounded', tol=10e-14)
         result = optimize.minimize_scalar(
             f, bounds=(interval[0], interval[1]), method="bounded", options={"xatol": 10e-14, "maxiter": 50}
         )
@@ -505,11 +521,27 @@ def _get_hypothetical_treatment_var(
     hypothetical_effect: float,
 ) -> float:
     if binary_metric and not non_inferiority:
-        # For binary metrics, the variance can be derived from the average. However,
-        # we do *not* do this for
-        # non-inferiority tests because for non-inferiority tests, the basic assumption
-        # is that the
-        # mean of the control group and treatment group are identical.
         return (control_avg + hypothetical_effect) * (1 - (control_avg + hypothetical_effect))
     else:
         return control_var
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible module-level function aliases so that existing
+# ``z_test_computer.point_estimate(df, ...)`` call-sites keep working.
+# ---------------------------------------------------------------------------
+
+_singleton = ZTestComputer()
+
+point_estimate = _singleton.point_estimate
+variance = _singleton.variance
+std_err = _singleton.std_err
+add_point_estimate_ci = _singleton.add_point_estimate_ci
+p_value = _singleton.p_value
+ci = _singleton.ci
+achieved_power = _singleton.achieved_power
+compute_sequential_adjusted_alpha = _singleton.compute_sequential_adjusted_alpha
+ci_for_multiple_comparison_methods = _singleton.ci_for_multiple_comparison_methods
+powered_effect = _singleton.powered_effect
+required_sample_size = _singleton.required_sample_size
+ci_width = _singleton.ci_width
