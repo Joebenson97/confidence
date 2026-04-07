@@ -17,7 +17,6 @@ import warnings
 from abc import ABCMeta, abstractmethod
 from functools import wraps
 
-import chartify
 import numpy as np
 import pandas as pd
 
@@ -208,6 +207,8 @@ class BaseTest(object, metaclass=ABCMeta):
     def _ordinal_plot(self, center_name, df, groupby, level_name, remaining_groups, absolute, title, y_axis_label):
         df = add_color_column(df, remaining_groups)
         colors = "color" if remaining_groups else None
+        import chartify
+
         ch = chartify.Chart(x_axis_type=self._ordinal_type())
         ch.plot.line(
             data_frame=df.sort_values(self._ordinal_group_column),

@@ -14,7 +14,6 @@
 
 from collections import OrderedDict
 
-import chartify
 import numpy as np
 import pandas as pd
 from scipy.stats import beta
@@ -139,6 +138,8 @@ class BetaBinomial(BaseTest):
 
         # Remove legend if only one color
         color_column = "group" if len(grouped_df) > 1 else None
+
+        import chartify
 
         ch = chartify.Chart()
         ch.plot.area(
@@ -325,6 +326,8 @@ class BetaBinomial(BaseTest):
         # Take the difference posterior and create a chart
         df = pd.DataFrame({"values": difference_posterior})
 
+        import chartify
+
         ch = chartify.Chart(y_axis_type="density", x_axis_type="linear")
 
         ch.plot.kde(df, "values")
@@ -491,6 +494,8 @@ class BetaBinomial(BaseTest):
         # Take the difference posterior and create a chart
         df = pd.DataFrame({"values": difference_posterior})
 
+        import chartify
+
         ch = chartify.Chart(y_axis_type="density", x_axis_type="linear")
 
         ch.plot.kde(df, "values")
@@ -653,6 +658,8 @@ class BetaBinomial(BaseTest):
 
         # Take the difference posterior and create a chart
         # df = pd.DataFrame({'values': difference_posterior})
+
+        import chartify
 
         ch = chartify.Chart(y_axis_type="density", x_axis_type="linear")
 
