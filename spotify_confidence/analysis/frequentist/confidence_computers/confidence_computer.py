@@ -12,12 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
-import numpy as np
-from numpy import isnan
 from pandas import DataFrame
-from scipy import stats as st
 
 from spotify_confidence.analysis.abstract_base_classes.confidence_computer_abc import ConfidenceComputerABC
 from spotify_confidence.analysis.confidence_utils import (
@@ -29,17 +26,14 @@ from spotify_confidence.analysis.confidence_utils import (
     level2str,
     listify,
     remove_group_columns,
-    reset_named_indices,
     validate_and_rename_columns,
     validate_data,
     validate_levels,
 )
 from spotify_confidence.analysis.constants import (
     ABSOLUTE,
-    ADJUSTED_ALPHA_POWER_SAMPLE_SIZE,
     ADJUSTED_LOWER,
     ADJUSTED_P,
-    ADJUSTED_POWER,
     ADJUSTED_UPPER,
     ALTERNATIVE_HYPOTHESIS,
     BOOTSTRAP,
@@ -51,9 +45,6 @@ from spotify_confidence.analysis.constants import (
     CORRECTION_METHODS,
     DENOMINATOR,
     DIFFERENCE,
-    FEATURE,
-    FEATURE_CROSS,
-    FEATURE_SUMSQ,
     FINAL_EXPECTED_SAMPLE_SIZE,
     INTERVAL_SIZE,
     IS_SIGNIFICANT,
@@ -67,36 +58,33 @@ from spotify_confidence.analysis.constants import (
     NUMERATOR,
     NUMERATOR_SUM_OF_SQUARES,
     ORDINAL_GROUP_COLUMN,
-    ORIGINAL_POINT_ESTIMATE,
-    ORIGINAL_VARIANCE,
     P_VALUE,
     POINT_ESTIMATE,
     POWER,
     POWERED_EFFECT,
     PREFERENCE,
-    PREFERENCE_DICT,
     PREFERENCE_TEST,
     PREFERRED_DIRECTION_COLUMN_DEFAULT,
     REQUIRED_SAMPLE_SIZE,
-    REQUIRED_SAMPLE_SIZE_METRIC,
     SFX1,
     SFX2,
-    STD_ERR,
     TTEST,
-    TWO_SIDED,
-    VARIANCE,
-    VARIANCE_REDUCTION,
     ZTEST,
     ZTESTLINREG,
 )
 from spotify_confidence.analysis.frequentist.confidence_computers import confidence_computers
+from spotify_confidence.analysis.frequentist.confidence_computers.comparison_pipeline import (
+    add_ci_and_adjust_if_absolute,
+    compute_comparisons,
+)
+from spotify_confidence.analysis.frequentist.confidence_computers.sufficient_statistics import (
+    SufficientStatisticsBuilder,
+)
 from spotify_confidence.analysis.frequentist.multiple_comparison import (
     add_adjusted_p_and_is_significant,
     add_adjusted_power,
-    add_ci,
     get_num_comparisons,
     get_preference,
-    set_alpha_and_adjust_preference,
 )
 from spotify_confidence.analysis.frequentist.nims_and_mdes import (
     add_nim_input_columns_from_tuple_or_dict,
@@ -182,6 +170,18 @@ class ConfidenceComputer(ConfidenceComputerABC):
         validate_data(self._df, columns_that_must_exist, self._all_group_columns, self._ordinal_group_column)
 
         self._sufficient = None
+        self._stats_builder = SufficientStatisticsBuilder(
+            numerator=self._numerator,
+            numerator_sumsq=self._numerator_sumsq,
+            denominator=self._denominator,
+            bootstrap_samples_column=self._bootstrap_samples_column,
+            interval_size=self._interval_size,
+            feature=self._feature,
+            feature_ssq=self._feature_ssq,
+            feature_cross=self._feature_cross,
+            method_column=self._method_column,
+            metric_column=self._metric_column,
+        )
 
     def compute_summary(self, verbose: bool) -> DataFrame:
         return (
@@ -198,64 +198,7 @@ class ConfidenceComputer(ConfidenceComputerABC):
     @property
     def _sufficient_statistics(self) -> DataFrame:
         if self._sufficient is None:
-            kwargs = {
-                NUMERATOR: self._numerator,
-                NUMERATOR_SUM_OF_SQUARES: self._numerator_sumsq,
-                DENOMINATOR: self._denominator,
-                BOOTSTRAPS: self._bootstrap_samples_column,
-                INTERVAL_SIZE: self._interval_size,
-                FEATURE: self._feature,
-                FEATURE_SUMSQ: self._feature_ssq,
-                FEATURE_CROSS: self._feature_cross,
-            }
-            groupby = [col for col in [self._method_column, self._metric_column] if col is not None]
-            self._sufficient = (
-                self._df.groupby(groupby, sort=False, group_keys=True)
-                .apply(
-                    lambda df: (
-                        df.assign(
-                            **{
-                                POINT_ESTIMATE: lambda df: confidence_computers[
-                                    df[self._method_column].values[0]
-                                ].point_estimate(df, **kwargs)
-                            }
-                        )
-                        .assign(
-                            **{
-                                ORIGINAL_POINT_ESTIMATE: lambda df: (
-                                    confidence_computers[ZTEST].point_estimate(df, **kwargs)
-                                    if df[self._method_column].values[0] == ZTESTLINREG
-                                    else confidence_computers[df[self._method_column].values[0]].point_estimate(
-                                        df, **kwargs
-                                    )
-                                )
-                            }
-                        )
-                        .assign(
-                            **{
-                                VARIANCE: lambda df: confidence_computers[df[self._method_column].values[0]].variance(
-                                    df, **kwargs
-                                )
-                            }
-                        )
-                        .assign(
-                            **{
-                                ORIGINAL_VARIANCE: lambda df: (
-                                    confidence_computers[ZTEST].variance(df, **kwargs)
-                                    if df[self._method_column].values[0] == ZTESTLINREG
-                                    else confidence_computers[df[self._method_column].values[0]].variance(df, **kwargs)
-                                )
-                            }
-                        )
-                        .pipe(
-                            lambda df: confidence_computers[df[self._method_column].values[0]].add_point_estimate_ci(
-                                df, **kwargs
-                            )
-                        )
-                    )
-                )
-                .pipe(reset_named_indices)
-            )
+            self._sufficient = self._stats_builder.build(self._df)
         return self._sufficient
 
     def compute_difference(
@@ -524,14 +467,14 @@ class ConfidenceComputer(ConfidenceComputerABC):
             comparison_df.groupby(
                 groups_except_ordinal + [self._method_column, "level_1", "level_2"], as_index=False, sort=False
             ),
-            lambda df: _compute_comparisons(df, **kwargs),
+            lambda df: compute_comparisons(df, **kwargs),
         )
         comparison_df = comparison_df.pipe(add_adjusted_p_and_is_significant, **kwargs)
         comparison_df = groupbyApplyParallel(
             comparison_df.groupby(
                 groups_except_ordinal + [self._method_column, "level_1", "level_2"], as_index=False, sort=False
             ),
-            lambda df: _add_ci_and_adjust_if_absolute(df, **kwargs),
+            lambda df: add_ci_and_adjust_if_absolute(df, **kwargs),
         )
 
         return comparison_df
@@ -570,129 +513,8 @@ class ConfidenceComputer(ConfidenceComputerABC):
         )[["level_1", "level_2", "achieved_power"]]
 
 
-def _compute_comparisons(df: DataFrame, **kwargs: Any) -> DataFrame:
-    return (
-        df.assign(**{DIFFERENCE: lambda df: df[POINT_ESTIMATE + SFX2] - df[POINT_ESTIMATE + SFX1]})
-        .assign(**{STD_ERR: confidence_computers[df[kwargs[METHOD]].values[0]].std_err(df, **kwargs)})
-        .pipe(_add_p_value, **kwargs)
-        .pipe(_powered_effect_and_required_sample_size_from_difference_df, **kwargs)
-        .assign(**{PREFERENCE: lambda df: df[PREFERENCE].map(PREFERENCE_DICT)})
-        .pipe(_add_variance_reduction_rate, **kwargs)
-    )
-
-
-def _add_variance_reduction_rate(df: DataFrame, **kwargs: Any) -> DataFrame:
-    denominator = kwargs[DENOMINATOR]
-    method_column = kwargs[METHOD]
-    if (df[method_column] == ZTESTLINREG).any():
-        variance_no_reduction = (
-            df[ORIGINAL_VARIANCE + SFX1] / df[denominator + SFX1]
-            + df[ORIGINAL_VARIANCE + SFX2] / df[denominator + SFX2]
-        )
-        variance_w_reduction = (
-            df[VARIANCE + SFX1] / df[denominator + SFX1] + df[VARIANCE + SFX2] / df[denominator + SFX2]
-        )
-        df = df.assign(**{VARIANCE_REDUCTION: 1 - np.divide(variance_w_reduction, variance_no_reduction)})
-    return df
-
-
-def _add_p_value(df: DataFrame, **kwargs: Any) -> DataFrame:
-    return df.pipe(set_alpha_and_adjust_preference, **kwargs).assign(
-        **{P_VALUE: lambda df: df.pipe(_p_value, **kwargs)}
-    )
-
-
-def _add_ci_and_adjust_if_absolute(df: DataFrame, **kwargs: Any) -> DataFrame:
-    return df.pipe(add_ci, **kwargs).pipe(_adjust_if_absolute, absolute=kwargs[ABSOLUTE])
-
-
-def _adjust_if_absolute(df: DataFrame, absolute: bool) -> DataFrame:
-    if absolute:
-        return df.assign(absolute_difference=absolute)
-    else:
-        return (
-            df.assign(absolute_difference=absolute)
-            .assign(**{DIFFERENCE: df[DIFFERENCE] / df[POINT_ESTIMATE + SFX1]})
-            .assign(**{CI_LOWER: df[CI_LOWER] / df[POINT_ESTIMATE + SFX1]})
-            .assign(**{CI_UPPER: df[CI_UPPER] / df[POINT_ESTIMATE + SFX1]})
-            .assign(**{ADJUSTED_LOWER: df[ADJUSTED_LOWER] / df[POINT_ESTIMATE + SFX1]})
-            .assign(**{ADJUSTED_UPPER: df[ADJUSTED_UPPER] / df[POINT_ESTIMATE + SFX1]})
-            .assign(**{NULL_HYPOTHESIS: df[NULL_HYPOTHESIS] / df[POINT_ESTIMATE + SFX1]})
-            .assign(**{POWERED_EFFECT: df[POWERED_EFFECT] / df[POINT_ESTIMATE + SFX1]})
-        )
-
-
-def _p_value(df: DataFrame, **kwargs: Any) -> float:
-    if df[kwargs[METHOD]].values[0] == CHI2 and (df[NIM].notna()).any():
-        raise ValueError("Non-inferiority margins not supported in ChiSquared. Use StudentsTTest or ZTest instead.")
-    return confidence_computers[df[kwargs[METHOD]].values[0]].p_value(df, **kwargs)
-
-
-def _powered_effect_and_required_sample_size_from_difference_df(df: DataFrame, **kwargs: Any) -> DataFrame:
-    method = df[kwargs[METHOD]].values[0]
-    computer = confidence_computers[method]
-    if not computer.supports_mde and kwargs[MDE] in df:
-        raise ValueError("Minimum detectable effects only supported for ZTest.")
-    elif not computer.supports_powered_effect or (df[ADJUSTED_POWER].isna()).any():
-        df[POWERED_EFFECT] = None
-        df[REQUIRED_SAMPLE_SIZE] = None
-        df[REQUIRED_SAMPLE_SIZE_METRIC] = None
-        return df
-    else:
-        n1, n2 = df[kwargs[DENOMINATOR] + SFX1], df[kwargs[DENOMINATOR] + SFX2]
-        kappa = n1 / n2
-        binary = (df[kwargs[NUMERATOR_SUM_OF_SQUARES] + SFX1] == df[kwargs[NUMERATOR] + SFX1]).all()
-        proportion_of_total = (n1 + n2) / df[f"current_total_{kwargs[DENOMINATOR]}"]
-
-        z_alpha = st.norm.ppf(
-            1
-            - df[ADJUSTED_ALPHA_POWER_SAMPLE_SIZE].values[0] / (2 if df[PREFERENCE_TEST].values[0] == TWO_SIDED else 1)
-        )
-        z_power = st.norm.ppf(df[ADJUSTED_POWER].values[0])
-
-        nim = df[NIM].values[0]
-        if isinstance(nim, float):
-            non_inferiority = not isnan(nim)
-        elif nim is None:
-            non_inferiority = nim is not None
-
-        df[POWERED_EFFECT] = confidence_computers[df[kwargs[METHOD]].values[0]].powered_effect(
-            df=df.assign(kappa=kappa)
-            .assign(current_number_of_units=df[f"current_total_{kwargs[DENOMINATOR]}"])
-            .assign(proportion_of_total=proportion_of_total),
-            z_alpha=z_alpha,
-            z_power=z_power,
-            binary=binary,
-            non_inferiority=non_inferiority,
-            avg_column=ORIGINAL_POINT_ESTIMATE + SFX1,
-            var_column=VARIANCE + SFX1,
-        )
-
-        if ALTERNATIVE_HYPOTHESIS in df and NULL_HYPOTHESIS in df and (df[ALTERNATIVE_HYPOTHESIS].notna()).all():
-            df[REQUIRED_SAMPLE_SIZE] = confidence_computers[df[kwargs[METHOD]].values[0]].required_sample_size(
-                proportion_of_total=1,
-                z_alpha=z_alpha,
-                z_power=z_power,
-                binary=binary,
-                non_inferiority=non_inferiority,
-                hypothetical_effect=df[ALTERNATIVE_HYPOTHESIS] - df[NULL_HYPOTHESIS],
-                control_avg=df[ORIGINAL_POINT_ESTIMATE + SFX1],
-                control_var=df[VARIANCE + SFX1],
-                kappa=kappa,
-            )
-            df[REQUIRED_SAMPLE_SIZE_METRIC] = confidence_computers[df[kwargs[METHOD]].values[0]].required_sample_size(
-                proportion_of_total=proportion_of_total,
-                z_alpha=z_alpha,
-                z_power=z_power,
-                binary=binary,
-                non_inferiority=non_inferiority,
-                hypothetical_effect=df[ALTERNATIVE_HYPOTHESIS] - df[NULL_HYPOTHESIS],
-                control_avg=df[ORIGINAL_POINT_ESTIMATE + SFX1],
-                control_var=df[VARIANCE + SFX1],
-                kappa=kappa,
-            )
-        else:
-            df[REQUIRED_SAMPLE_SIZE] = None
-            df[REQUIRED_SAMPLE_SIZE_METRIC] = None
-
-        return df
+# ---------------------------------------------------------------------------
+# Backward-compatible aliases — logic lives in comparison_pipeline.py
+# ---------------------------------------------------------------------------
+_compute_comparisons = compute_comparisons
+_add_ci_and_adjust_if_absolute = add_ci_and_adjust_if_absolute
