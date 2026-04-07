@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from functools import reduce
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Union
 
 import numpy as np
 from pandas import DataFrame, Series
@@ -13,10 +15,14 @@ from spotify_confidence.analysis.constants import (
     NUMERATOR,
     REGRESSION_PARAM,
 )
-from spotify_confidence.analysis.frequentist.confidence_computers import z_test_computer
+from spotify_confidence.analysis.frequentist.confidence_computers.z_test_computer import ZTestComputer
 
 
-def estimate_slope(df, **kwargs: Any) -> DataFrame:
+# Keep the module-level z_test singleton for delegation
+_z_test = ZTestComputer()
+
+
+def _estimate_slope(df, **kwargs: Any) -> DataFrame:
     if kwargs[FEATURE] not in df:
         return df
 
@@ -51,28 +57,7 @@ def estimate_slope(df, **kwargs: Any) -> DataFrame:
     return df
 
 
-def point_estimate(df: DataFrame, **kwargs) -> float:
-    df = estimate_slope(df, **kwargs)
-    point_estimate = df[kwargs[NUMERATOR]] / df[kwargs[DENOMINATOR]]
-
-    if REGRESSION_PARAM in df:
-        feature_mean = df[kwargs[FEATURE]].sum() / df[kwargs[DENOMINATOR]].sum()
-
-        def lin_reg_point_estimate_delta(row: Series, feature_mean: float, **kwargs: Any) -> Series:
-            return dfmatmul(
-                row[REGRESSION_PARAM], row[kwargs[FEATURE]] - feature_mean * row[kwargs[DENOMINATOR]], outer=False
-            )
-
-        return (
-            point_estimate
-            - df.apply(lin_reg_point_estimate_delta, feature_mean=feature_mean, axis=1, **kwargs)
-            / df[kwargs[DENOMINATOR]]
-        )
-
-    return point_estimate
-
-
-def lin_reg_variance_delta(row, **kwargs):
+def _lin_reg_variance_delta(row, **kwargs):
     y = row[kwargs[NUMERATOR]]
     n = row[kwargs[DENOMINATOR]]
 
@@ -89,64 +74,67 @@ def lin_reg_variance_delta(row, **kwargs):
     return variance2 + variance3
 
 
-def variance(df: DataFrame, **kwargs) -> Union[float, Series]:
-    variance1 = z_test_computer.variance(df, **kwargs)
-    if kwargs[FEATURE] in df:
-        computed_variances = variance1 + df.apply(lin_reg_variance_delta, axis=1, **kwargs)
-        if (computed_variances < 0).any():
-            raise ValueError("Computed variance is negative, please check sufficient statistics.")
-        return computed_variances
-    else:
-        return variance1
+class ZTestLinregComputer(ZTestComputer):
+    """Z-test with linear regression adjustment."""
+
+    @property
+    def supports_sequential(self) -> bool:
+        return True
+
+    @property
+    def supports_powered_effect(self) -> bool:
+        return True
+
+    @property
+    def supports_mde(self) -> bool:
+        return True
+
+    def point_estimate(self, df: DataFrame, **kwargs: Any) -> Union[float, Series]:
+        df = _estimate_slope(df, **kwargs)
+        pe = df[kwargs[NUMERATOR]] / df[kwargs[DENOMINATOR]]
+
+        if REGRESSION_PARAM in df:
+            feature_mean = df[kwargs[FEATURE]].sum() / df[kwargs[DENOMINATOR]].sum()
+
+            def lin_reg_point_estimate_delta(row: Series, feature_mean: float, **kwargs: Any) -> Series:
+                return dfmatmul(
+                    row[REGRESSION_PARAM], row[kwargs[FEATURE]] - feature_mean * row[kwargs[DENOMINATOR]], outer=False
+                )
+
+            return (
+                pe
+                - df.apply(lin_reg_point_estimate_delta, feature_mean=feature_mean, axis=1, **kwargs)
+                / df[kwargs[DENOMINATOR]]
+            )
+
+        return pe
+
+    def variance(self, df: DataFrame, **kwargs: Any) -> Union[float, Series]:
+        variance1 = _z_test.variance(df, **kwargs)
+        if kwargs[FEATURE] in df:
+            computed_variances = variance1 + df.apply(_lin_reg_variance_delta, axis=1, **kwargs)
+            if (computed_variances < 0).any():
+                raise ValueError("Computed variance is negative, please check sufficient statistics.")
+            return computed_variances
+        else:
+            return variance1
 
 
-def add_point_estimate_ci(df: DataFrame, **kwargs: Any) -> DataFrame:
-    return z_test_computer.add_point_estimate_ci(df, **kwargs)
+# ---------------------------------------------------------------------------
+# Backward-compatible module-level function aliases
+# ---------------------------------------------------------------------------
 
+_singleton = ZTestLinregComputer()
 
-def std_err(df: DataFrame, **kwargs: Any) -> float:
-    return z_test_computer.std_err(df, **kwargs)
+# Keep old names available at module level
+estimate_slope = _estimate_slope
+lin_reg_variance_delta = _lin_reg_variance_delta
 
-
-def p_value(df: DataFrame, **kwargs: Any) -> Series:
-    return z_test_computer.p_value(df, **kwargs)
-
-
-def ci(df: DataFrame, alpha_column: str, **kwargs: Any) -> Tuple[Series, Series]:
-    return z_test_computer.ci(df, alpha_column, **kwargs)
-
-
-def powered_effect(
-    df: DataFrame,
-    z_alpha: float,
-    z_power: float,
-    binary: bool,
-    non_inferiority: bool,
-    avg_column: float,
-    var_column: float,
-) -> Series:
-    return z_test_computer.powered_effect(df, z_alpha, z_power, binary, non_inferiority, avg_column, var_column)
-
-
-def required_sample_size(
-    binary: Union[Series, bool],
-    non_inferiority: Union[Series, bool],
-    hypothetical_effect: Union[Series, float],
-    control_avg: Union[Series, float],
-    control_var: Union[Series, float],
-    z_alpha: Optional[float] = None,
-    kappa: Optional[float] = None,
-    proportion_of_total: Optional[Union[Series, float]] = None,
-    z_power: Optional[float] = None,
-) -> Union[Series, float]:
-    return z_test_computer.required_sample_size(
-        binary,
-        non_inferiority,
-        hypothetical_effect,
-        control_avg,
-        control_var,
-        z_alpha,
-        kappa,
-        proportion_of_total,
-        z_power,
-    )
+point_estimate = _singleton.point_estimate
+variance = _singleton.variance
+add_point_estimate_ci = _singleton.add_point_estimate_ci
+std_err = _singleton.std_err
+p_value = _singleton.p_value
+ci = _singleton.ci
+powered_effect = _singleton.powered_effect
+required_sample_size = _singleton.required_sample_size

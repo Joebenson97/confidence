@@ -30,7 +30,11 @@ from ..confidence_utils import (
 )
 from ..constants import BONFERRONI, METHODS, NIM_TYPE
 from ..frequentist.sample_ratio_test import sample_ratio_test
-from .chartify_grapher import ChartifyGrapher
+
+try:
+    from .chartify_grapher import ChartifyGrapher
+except ImportError:
+    ChartifyGrapher = None
 
 
 class Experiment(ConfidenceABC):
@@ -125,17 +129,26 @@ class Experiment(ConfidenceABC):
                 feature_cross_sum_column=feature_cross_sum_column,
             )
 
-        self._confidence_grapher = (
-            confidence_grapher
-            if confidence_grapher is not None
-            else ChartifyGrapher(
+        if confidence_grapher is not None:
+            self._confidence_grapher = confidence_grapher
+        elif ChartifyGrapher is not None:
+            self._confidence_grapher = ChartifyGrapher(
                 data_frame=self._df,
                 numerator_column=self._numerator,
                 denominator_column=self._denominator,
                 categorical_group_columns=self._categorical_group_columns,
                 ordinal_group_column=self._ordinal_group_column,
             )
-        )
+        else:
+            from .null_grapher import NullGrapher
+
+            self._confidence_grapher = NullGrapher(
+                data_frame=self._df,
+                numerator_column=self._numerator,
+                denominator_column=self._denominator,
+                categorical_group_columns=self._categorical_group_columns,
+                ordinal_group_column=self._ordinal_group_column,
+            )
 
     def summary(self, verbose: bool = False) -> DataFrame:
         return self._confidence_computer.compute_summary(verbose)

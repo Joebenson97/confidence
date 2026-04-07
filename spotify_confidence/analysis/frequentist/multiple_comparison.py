@@ -51,8 +51,6 @@ from spotify_confidence.analysis.constants import (
     SPOT_1_SIDAK,
     SPOT_1_SIMES_HOCHBERG,
     TWO_SIDED,
-    ZTEST,
-    ZTESTLINREG,
 )
 from spotify_confidence.analysis.frequentist.confidence_computers import confidence_computers
 
@@ -204,8 +202,10 @@ def add_adjusted_p_and_is_significant(df: DataFrame, **kwargs: Any) -> DataFrame
 
 
 def compute_sequential_adjusted_alpha(df: DataFrame, **kwargs: Any) -> DataFrame:
-    if df[kwargs[METHOD]].isin([ZTEST, ZTESTLINREG]).all():
-        adjusted_alpha = confidence_computers[ZTEST].compute_sequential_adjusted_alpha(df, **kwargs)
+    method = df[kwargs[METHOD]].values[0]
+    computer = confidence_computers[method]
+    if computer.supports_sequential:
+        adjusted_alpha = computer.compute_sequential_adjusted_alpha(df, **kwargs)
         df = df.merge(adjusted_alpha, left_index=True, right_index=True)
         df[IS_SIGNIFICANT] = df[P_VALUE] < df[ADJUSTED_ALPHA]
         df[P_VALUE] = None
